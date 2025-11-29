@@ -10,6 +10,7 @@ The script now:
 - Captures frames using `picamera2` with Raspberry Pi AI camera
 - Runs Hailo inference directly using HailoRT SDK
 - Parses YOLO detection results from Hailo NPU
+- **Serves live web interface** at http://[device-ip]:3009 with detection bounding boxes
 - Saves images only when target class is detected with sufficient confidence
 - Creates JSON metadata files with detection details
 
@@ -26,7 +27,9 @@ The `save_on_detection.py` script uses:
 ### Features
 
 - ✅ Direct access to detection results (class IDs, confidence, bounding boxes)
-- ✅ Configurable target class (default: "cat")
+- ✅ **Live web interface** with MJPEG video streaming
+- ✅ Real-time detection visualization with bounding boxes
+- ✅ Configurable target class (default: "person")
 - ✅ Configurable confidence threshold (default: 0.7)
 - ✅ Automatic model selection (Hailo-8L or Hailo-8)
 - ✅ Saves detection metadata as JSON
@@ -41,13 +44,14 @@ The `save_on_detection.py` script uses:
   - `hailo_platform` - Hailo SDK
   - `opencv-python` - Image processing
   - `numpy` - Array operations
+  - `flask` - Web server for live streaming
 
 ## Usage
 
 ```bash
 # Edit the script to set your target class (optional)
 nano save_on_detection.py
-# Change: TARGET_CLASS = "cat"  # or "dog", "person", etc.
+# Change: TARGET_CLASS = "person"  # or "cat", "dog", etc.
 # Change: CONFIDENCE_THRESHOLD = 0.7  # Adjust as needed
 
 # Run the script
@@ -57,9 +61,22 @@ python3 save_on_detection.py
 The script will:
 1. Initialize the Hailo NPU and load the YOLOv6 model
 2. Initialize the Raspberry Pi camera
-3. Continuously capture frames and run inference
-4. Save images to `images/` when target class is detected
-5. Save detection metadata to `detections/` as JSON files
+3. Start a web server on port 3009
+4. Continuously capture frames and run inference
+5. Save images to `images/` when target class is detected
+6. Save detection metadata to `detections/` as JSON files
+
+### Web Interface
+
+When the script is running, access the live detection stream at:
+- **http://[device-ip]:3009** (from other devices on the network)
+- **http://localhost:3009** (from the Raspberry Pi itself)
+
+The web interface shows:
+- Live camera feed with YOLO detection bounding boxes
+- Green boxes for target class detections (person)
+- Orange boxes for other detected objects
+- Real-time detection information
 
 Press `Ctrl+C` to stop.
 

@@ -7,11 +7,14 @@ Saves images only when target object (person) is detected by Hailo NPU.
 
 import json
 import time
+import threading
 import numpy as np
 import cv2
 from pathlib import Path
 from datetime import datetime
 from picamera2 import Picamera2
+from flask import Flask, Response, render_template_string
+import socket
 
 # Hailo SDK imports
 try:
@@ -34,6 +37,13 @@ TARGET_CLASS = "person"  # COCO class ID for person is 0 (YOLOv6 uses COCO class
 CONFIDENCE_THRESHOLD = 0.7
 MIN_TIME_BETWEEN_SAVES = 5.0  # seconds
 MODEL_INPUT_SIZE = 640  # YOLOv6 input size
+
+# Web server settings
+WEB_PORT = 3009
+# Global frame buffer for web streaming
+latest_frame = None
+latest_detections = []
+frame_lock = threading.Lock()
 
 # HEF model paths (try H8L first, fallback to H8)
 HEF_PATH_H8L = "/usr/share/hailo-models/yolov6n_h8l.hef"
@@ -394,8 +404,69 @@ def check_target_detected(detections: list) -> tuple[bool, list]:
     return len(target_detections) > 0, target_detections
 
 
+def draw_detections(frame: np.ndarray, detections: list) -> np.ndarray:
+    """Draw bounding boxes and labels on frame - only for target class (person)."""
+    frame_with_boxes = frame.copy()
+    
+    # Convert RGB to BGR for OpenCV drawing
+    if len(frame_with_boxes.shape) == 3 and frame_with_boxes.shape[2] == 3:
+        frame_with_boxes = cv2.cvtColor(frame_with_boxes, cv2.COLOR_RGB2BGR)
+    
+    # Filter detections to only show target class
+    target_detections = [det for det in detections 
+                        if isinstance(det, dict) and det.get('class_id', -1) == TARGET_CLASS_ID]
+    
+    for det in target_detections:
+        if isinstance(det, dict):
+            bbox = det.get('bbox', {})
+            class_name = det.get('class_name', 'unknown')
+            confidence = det.get('confidence', 0.0)
+            class_id = det.get('class_id', -1)
+            
+            x_min = int(bbox.get('x_min', 0))
+            y_min = int(bbox.get('y_min', 0))
+            x_max = int(bbox.get('x_max', 0))
+            y_max = int(bbox.get('y_max', 0))
+            
+            # Scale coordinates from model input size (640x640) to actual frame size
+            frame_h, frame_w = frame_with_boxes.shape[:2]
+            scale_x = frame_w / MODEL_INPUT_SIZE
+            scale_y = frame_h / MODEL_INPUT_SIZE
+            
+            x_min = int(x_min * scale_x)
+            y_min = int(y_min * scale_y)
+            x_max = int(x_max * scale_x)
+            y_max = int(y_max * scale_y)
+            
+            # Use green color for target class (person)
+            color = (0, 255, 0)  # Green for target class
+            
+            # Draw bounding box
+            cv2.rectangle(frame_with_boxes, (x_min, y_min), (x_max, y_max), color, 2)
+            
+            # Draw label with class name and confidence
+            label = f"{class_name}: {confidence:.2f}"
+            label_size, _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+            label_y = max(y_min - 10, label_size[1] + 10)
+            
+            # Draw label background
+            cv2.rectangle(frame_with_boxes, 
+                         (x_min, label_y - label_size[1] - 5),
+                         (x_min + label_size[0], label_y + 5),
+                         color, -1)
+            
+            # Draw label text
+            cv2.putText(frame_with_boxes, label,
+                       (x_min, label_y),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+    
+    return frame_with_boxes
+
+
 def capture_and_check(picam2: Picamera2, detector: HailoDetector) -> bool:
     """Capture a frame, run inference, and save if target detected."""
+    global latest_frame, latest_detections
+    
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     image_file = IMAGE_DIR / f"detection_{timestamp}.jpg"
     
@@ -405,6 +476,12 @@ def capture_and_check(picam2: Picamera2, detector: HailoDetector) -> bool:
         
         # Run Hailo inference
         detections = detector.infer(frame)
+        
+        # Update global frame buffer for web streaming
+        frame_with_boxes = draw_detections(frame, detections)
+        with frame_lock:
+            latest_frame = frame_with_boxes
+            latest_detections = detections
         
         # Check if target class detected
         detected, target_detections = check_target_detected(detections)
@@ -464,6 +541,157 @@ def capture_and_check(picam2: Picamera2, detector: HailoDetector) -> bool:
         return False
 
 
+# HTML template for web interface
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Hailo Detection Live Stream</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #1a1a1a;
+            color: #ffffff;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        h1 {
+            text-align: center;
+            color: #4CAF50;
+        }
+        .video-container {
+            text-align: center;
+            background-color: #000;
+            padding: 10px;
+            border-radius: 10px;
+            margin: 20px 0;
+        }
+        img {
+            max-width: 100%;
+            height: auto;
+            border: 2px solid #4CAF50;
+            border-radius: 5px;
+        }
+        .info {
+            background-color: #2a2a2a;
+            padding: 15px;
+            border-radius: 5px;
+            margin: 10px 0;
+        }
+        .status {
+            display: inline-block;
+            padding: 5px 10px;
+            border-radius: 3px;
+            margin: 5px;
+        }
+        .status.active {
+            background-color: #4CAF50;
+        }
+        .status.inactive {
+            background-color: #f44336;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎥 Hailo Detection Live Stream</h1>
+        <div class="info">
+            <strong>Target Class:</strong> <span class="status active">{{ target_class }}</span>
+            <strong>Confidence Threshold:</strong> {{ confidence_threshold }}
+            <strong>Status:</strong> <span class="status active">LIVE</span>
+        </div>
+        <div class="video-container">
+            <img src="/video_feed" alt="Live Detection Stream">
+        </div>
+        <div class="info">
+            <p><strong>Instructions:</strong> This page shows live camera feed with YOLO detection bounding boxes.</p>
+            <p>Green boxes indicate detected {{ target_class }} objects. Orange boxes show other detected objects.</p>
+        </div>
+    </div>
+</body>
+</html>
+"""
+
+
+def get_local_ip():
+    """Get the local IP address of the device."""
+    try:
+        # Connect to a remote address to determine local IP
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "localhost"
+
+
+def generate_frames():
+    """Generate MJPEG frames for video streaming."""
+    while True:
+        with frame_lock:
+            if latest_frame is not None:
+                frame = latest_frame.copy()
+            else:
+                # Create a placeholder frame if no frame available
+                frame = np.zeros((480, 640, 3), dtype=np.uint8)
+                cv2.putText(frame, "Waiting for camera...", (150, 240),
+                           cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+        
+        # Encode frame as JPEG
+        ret, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        if ret:
+            frame_bytes = buffer.tobytes()
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+        
+        time.sleep(0.033)  # ~30 FPS
+
+
+def create_flask_app():
+    """Create and configure Flask app."""
+    app = Flask(__name__)
+    
+    @app.route('/')
+    def index():
+        """Serve the main HTML page."""
+        return render_template_string(HTML_TEMPLATE,
+                                    target_class=TARGET_CLASS,
+                                    confidence_threshold=CONFIDENCE_THRESHOLD)
+    
+    @app.route('/video_feed')
+    def video_feed():
+        """Video streaming route."""
+        return Response(generate_frames(),
+                       mimetype='multipart/x-mixed-replace; boundary=frame')
+    
+    @app.route('/api/detections')
+    def api_detections():
+        """API endpoint to get current detections."""
+        with frame_lock:
+            return Response(json.dumps(latest_detections, default=str),
+                          mimetype='application/json')
+    
+    return app
+
+
+def start_web_server():
+    """Start Flask web server in a separate thread."""
+    app = create_flask_app()
+    local_ip = get_local_ip()
+    print(f"\n🌐 Web server starting...")
+    print(f"   Access at: http://{local_ip}:{WEB_PORT}")
+    print(f"   Or locally: http://localhost:{WEB_PORT}")
+    print("=" * 60)
+    
+    # Run Flask in a way that doesn't block
+    app.run(host='0.0.0.0', port=WEB_PORT, threaded=True, debug=False)
+
+
 def main():
     """Main loop."""
     print("=" * 60)
@@ -504,25 +732,31 @@ def main():
     try:
         picam2 = Picamera2()
         
-        # Configure camera for capture
-        # Use main stream for high-quality captures
-        config = picam2.create_still_configuration(
-            main={"size": (1920, 1080), "format": "RGB888"},
-            buffer_count=2
+        # Configure camera for fast video streaming
+        # Lower resolution for higher FPS (640x480 for 60fps)
+        config = picam2.create_video_configuration(
+            main={"size": (640, 480), "format": "RGB888"},
+            buffer_count=3  # More buffers for smoother streaming
         )
         picam2.configure(config)
         picam2.start()
         
         # Allow camera to stabilize
-        time.sleep(2)
-        print("Camera ready!")
+        time.sleep(1)
+        print("Camera ready! (640x480 @ 60fps)")
         
     except Exception as e:
         print(f"\n✗ ERROR initializing camera: {e}")
         detector.cleanup()
         return
     
-    print("\nStarting capture loop... (Press Ctrl+C to stop)\n")
+    # Start web server in a separate thread
+    web_thread = threading.Thread(target=start_web_server, daemon=True)
+    web_thread.start()
+    time.sleep(1)  # Give web server time to start
+    
+    print("\nStarting capture loop... (Press Ctrl+C to stop)")
+    print("Web interface is running in the background.\n")
     
     last_save_time = 0
     frame_count = 0

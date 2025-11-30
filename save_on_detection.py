@@ -160,26 +160,33 @@ class HailoDetector:
         
         return resized
     
-    def _add_detection(self, detections: list, class_id: int, x_center: float, y_center: float, 
-                      width: float, height: float, confidence: float):
-        """Helper method to add a detection to the list."""
+    def _add_detection(self, detections: list, class_id: int, ymin: float, xmin: float, 
+                      ymax: float, xmax: float, confidence: float):
+        """Helper method to add a detection to the list.
+        
+        Note: Hailo NMS usually returns [ymin, xmin, ymax, xmax, score].
+        These are normalized coordinates [0, 1].
+        """
         # Convert normalized coordinates to pixel coordinates
-        x_min = (x_center - width / 2) * MODEL_INPUT_SIZE
-        y_min = (y_center - height / 2) * MODEL_INPUT_SIZE
-        x_max = (x_center + width / 2) * MODEL_INPUT_SIZE
-        y_max = (y_center + height / 2) * MODEL_INPUT_SIZE
+        x_min_px = xmin * MODEL_INPUT_SIZE
+        y_min_px = ymin * MODEL_INPUT_SIZE
+        x_max_px = xmax * MODEL_INPUT_SIZE
+        y_max_px = ymax * MODEL_INPUT_SIZE
+        
+        width = x_max_px - x_min_px
+        height = y_max_px - y_min_px
         
         detections.append({
             'class_id': int(class_id),
             'class_name': COCO_CLASSES[class_id] if class_id < len(COCO_CLASSES) else f"class_{class_id}",
             'confidence': float(confidence),
             'bbox': {
-                'x_min': float(x_min),
-                'y_min': float(y_min),
-                'x_max': float(x_max),
-                'y_max': float(y_max),
-                'width': float(width * MODEL_INPUT_SIZE),
-                'height': float(height * MODEL_INPUT_SIZE)
+                'x_min': float(x_min_px),
+                'y_min': float(y_min_px),
+                'x_max': float(x_max_px),
+                'y_max': float(y_max_px),
+                'width': float(width),
+                'height': float(height)
             }
         })
     
@@ -240,15 +247,15 @@ class HailoDetector:
                                     # List format: [x, y, w, h, conf] or similar
                                     if len(det) >= 5:
                                         det_values = [float(v) for v in det[:5]]
-                                        x_center, y_center, width, height, confidence = det_values
+                                        ymin, xmin, ymax, xmax, confidence = det_values
                                         if confidence >= 0.01:
-                                            self._add_detection(detections, class_id, x_center, y_center, width, height, confidence)
+                                            self._add_detection(detections, class_id, ymin, xmin, ymax, xmax, confidence)
                                 elif isinstance(det, np.ndarray):
                                     # Numpy array format
                                     if len(det) >= 5:
-                                        x_center, y_center, width, height, confidence = det[:5]
+                                        ymin, xmin, ymax, xmax, confidence = det[:5]
                                         if confidence >= 0.01:
-                                            self._add_detection(detections, class_id, x_center, y_center, width, height, confidence)
+                                            self._add_detection(detections, class_id, ymin, xmin, ymax, xmax, confidence)
                             except (ValueError, TypeError, IndexError):
                                 continue
                     
@@ -263,14 +270,14 @@ class HailoDetector:
                             # Now should be (num_detections, 5)
                             for det in class_detections:
                                 if len(det) >= 5:
-                                    x_center, y_center, width, height, confidence = det[:5]
+                                    ymin, xmin, ymax, xmax, confidence = det[:5]
                                     if confidence >= 0.01:
-                                        self._add_detection(detections, class_id, x_center, y_center, width, height, confidence)
+                                        self._add_detection(detections, class_id, ymin, xmin, ymax, xmax, confidence)
                         elif len(class_detections.shape) == 1 and len(class_detections) >= 5:
                             # Single detection for this class
-                            x_center, y_center, width, height, confidence = class_detections[:5]
+                            ymin, xmin, ymax, xmax, confidence = class_detections[:5]
                             if confidence >= 0.01:
-                                self._add_detection(detections, class_id, x_center, y_center, width, height, confidence)
+                                self._add_detection(detections, class_id, ymin, xmin, ymax, xmax, confidence)
         
         # Handle numpy array format directly
         elif isinstance(output_data, np.ndarray):
@@ -292,11 +299,11 @@ class HailoDetector:
                         det = class_detections[:, det_idx]  # Shape: (5,)
                         
                         if len(det) >= 5:
-                            x_center, y_center, width, height, confidence = det[:5]
+                            ymin, xmin, ymax, xmax, confidence = det[:5]
                             
                             # Skip low confidence or invalid detections
                             if confidence >= 0.01:
-                                self._add_detection(detections, class_id, x_center, y_center, width, height, confidence)
+                                self._add_detection(detections, class_id, ymin, xmin, ymax, xmax, confidence)
             
             # Try format (80, 100, 5): [num_classes, max_detections, detection_data]
             elif dim1 == 100 and dim2 == 5:
@@ -310,11 +317,11 @@ class HailoDetector:
                         det = class_detections[det_idx]  # Shape: (5,)
                         
                         if len(det) >= 5:
-                            x_center, y_center, width, height, confidence = det[:5]
+                            ymin, xmin, ymax, xmax, confidence = det[:5]
                             
                             # Skip low confidence or invalid detections
                             if confidence >= 0.01:
-                                self._add_detection(detections, class_id, x_center, y_center, width, height, confidence)
+                                self._add_detection(detections, class_id, ymin, xmin, ymax, xmax, confidence)
             else:
                 # Unknown format - try to handle generically
                 print(f"Warning: Unknown output format shape {output_data.shape}, attempting generic parsing")
@@ -327,7 +334,7 @@ class HailoDetector:
         elif len(output_data.shape) == 2 and output_data.shape[1] >= 6:
             for det in output_data:
                 if len(det) >= 6:
-                    x_center, y_center, width, height, confidence, class_id = det[:6]
+                    ymin, xmin, ymax, xmax, confidence, class_id = det[:6]
                     
                     # Skip low confidence or invalid detections
                     if confidence < 0.01:
@@ -336,22 +343,25 @@ class HailoDetector:
                     class_id = int(class_id)
                     
                     # Convert normalized coordinates to pixel coordinates
-                    x_min = (x_center - width / 2) * MODEL_INPUT_SIZE
-                    y_min = (y_center - height / 2) * MODEL_INPUT_SIZE
-                    x_max = (x_center + width / 2) * MODEL_INPUT_SIZE
-                    y_max = (y_center + height / 2) * MODEL_INPUT_SIZE
+                    x_min_px = xmin * MODEL_INPUT_SIZE
+                    y_min_px = ymin * MODEL_INPUT_SIZE
+                    x_max_px = xmax * MODEL_INPUT_SIZE
+                    y_max_px = ymax * MODEL_INPUT_SIZE
+                    
+                    width = x_max_px - x_min_px
+                    height = y_max_px - y_min_px
                     
                     detections.append({
                         'class_id': class_id,
                         'class_name': COCO_CLASSES[class_id] if class_id < len(COCO_CLASSES) else f"class_{class_id}",
                         'confidence': float(confidence),
                         'bbox': {
-                            'x_min': float(x_min),
-                            'y_min': float(y_min),
-                            'x_max': float(x_max),
-                            'y_max': float(y_max),
-                            'width': float(width * MODEL_INPUT_SIZE),
-                            'height': float(height * MODEL_INPUT_SIZE)
+                            'x_min': float(x_min_px),
+                            'y_min': float(y_min_px),
+                            'x_max': float(x_max_px),
+                            'y_max': float(y_max_px),
+                            'width': float(width),
+                            'height': float(height)
                         }
                     })
         
@@ -397,8 +407,8 @@ def check_target_detected(detections: list) -> tuple[bool, list]:
         if isinstance(det, dict):
             class_id = det.get('class_id', -1)
             confidence = det.get('confidence', 0.0)
-            
-            if class_id == TARGET_CLASS_ID and confidence >= CONFIDENCE_THRESHOLD:
+        
+        if class_id == TARGET_CLASS_ID and confidence >= CONFIDENCE_THRESHOLD:
                 target_detections.append(det)
     
     return len(target_detections) > 0, target_detections
@@ -692,6 +702,94 @@ def start_web_server():
     app.run(host='0.0.0.0', port=WEB_PORT, threaded=True, debug=False)
 
 
+def video_capture_loop(picam2: Picamera2, detector: HailoDetector):
+    """Continuous video capture loop for smooth web streaming."""
+    global latest_frame, latest_detections
+    
+    print("Starting video capture loop...")
+    
+    while True:
+        try:
+            # Capture frame
+            frame = picam2.capture_array("main")
+            
+            # Run inference
+            detections = detector.infer(frame)
+            
+            # Update global frame buffer for web streaming
+            frame_with_boxes = draw_detections(frame, detections)
+            with frame_lock:
+                latest_frame = frame_with_boxes
+                latest_detections = detections
+            
+            # Small delay to limit CPU usage (max ~30fps)
+            time.sleep(0.03)
+            
+        except Exception as e:
+            print(f"Error in video loop: {e}")
+            time.sleep(1)
+
+
+def save_if_detected():
+    """Check latest detections and save if target found."""
+    global latest_detections, latest_frame
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    image_file = IMAGE_DIR / f"detection_{timestamp}.jpg"
+    
+    with frame_lock:
+        if not latest_detections or latest_frame is None:
+            return False
+        
+        current_detections = latest_detections
+        # Save the frame with bounding boxes drawn for better verification
+        current_frame = latest_frame.copy()
+    
+    # Check if target class detected
+    detected, target_detections = check_target_detected(current_detections)
+    
+    if detected:
+        # Save image (already in BGR format from draw_detections)
+        cv2.imwrite(str(image_file), current_frame)
+        
+        # Save metadata
+        metadata = {
+            "timestamp": datetime.now().isoformat(),
+            "image_path": str(image_file),
+            "target_class": TARGET_CLASS,
+            "target_class_id": TARGET_CLASS_ID,
+            "confidence_threshold": CONFIDENCE_THRESHOLD,
+            "detected": True,
+            "num_target_detections": len(target_detections),
+            "target_detections": [
+                {
+                    "class_id": det["class_id"],
+                    "class_name": det["class_name"],
+                    "confidence": det["confidence"],
+                    "bbox": det["bbox"]
+                }
+                for det in target_detections
+            ],
+            "all_detections": [
+                {
+                    "class_id": det["class_id"],
+                    "class_name": det["class_name"],
+                    "confidence": det["confidence"]
+                }
+                for det in current_detections
+            ]
+        }
+        
+        metadata_file = DETECTION_DIR / f"detection_{timestamp}.json"
+        with open(metadata_file, 'w') as f:
+            json.dump(metadata, f, indent=2)
+        
+        print(f"✓ Saved: {image_file.name} ({len(target_detections)} {TARGET_CLASS}(s) detected)")
+        return True
+    else:
+        return False
+
+
 def main():
     """Main loop."""
     print("=" * 60)
@@ -732,18 +830,18 @@ def main():
     try:
         picam2 = Picamera2()
         
-        # Configure camera for fast video streaming
-        # Lower resolution for higher FPS (640x480 for 60fps)
-        config = picam2.create_video_configuration(
-            main={"size": (640, 480), "format": "RGB888"},
-            buffer_count=3  # More buffers for smoother streaming
+        # Configure camera for capture
+        # Use main stream for high-quality captures
+        config = picam2.create_still_configuration(
+            main={"size": (1920, 1080), "format": "RGB888"},
+            buffer_count=2
         )
         picam2.configure(config)
         picam2.start()
         
         # Allow camera to stabilize
-        time.sleep(1)
-        print("Camera ready! (640x480 @ 60fps)")
+        time.sleep(2)
+        print("Camera ready!")
         
     except Exception as e:
         print(f"\n✗ ERROR initializing camera: {e}")
@@ -753,36 +851,34 @@ def main():
     # Start web server in a separate thread
     web_thread = threading.Thread(target=start_web_server, daemon=True)
     web_thread.start()
-    time.sleep(1)  # Give web server time to start
     
-    print("\nStarting capture loop... (Press Ctrl+C to stop)")
+    # Start video capture loop in a separate thread
+    video_thread = threading.Thread(target=video_capture_loop, args=(picam2, detector), daemon=True)
+    video_thread.start()
+    
+    time.sleep(2)  # Give threads time to start
+    
+    print("\nStarting main loop... (Press Ctrl+C to stop)")
     print("Web interface is running in the background.\n")
     
     last_save_time = 0
-    frame_count = 0
     
     try:
         while True:
-            frame_count += 1
             current_time = time.time()
             
-            # Only capture if enough time has passed
+            # Check if enough time has passed for saving
             if current_time - last_save_time >= MIN_TIME_BETWEEN_SAVES:
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] Frame {frame_count}...", end=" ")
-                
-                if capture_and_check(picam2, detector):
+                if save_if_detected():
                     last_save_time = current_time
                 
-                # Small delay between frames
-                time.sleep(0.5)
+                # Wait a bit before checking again
+                time.sleep(0.1)
             else:
-                # Wait until we can capture again
-                wait_time = MIN_TIME_BETWEEN_SAVES - (current_time - last_save_time)
-                time.sleep(min(wait_time, 1.0))
+                time.sleep(0.1)
                 
     except KeyboardInterrupt:
         print("\n\nStopped.")
-        print(f"Total frames processed: {frame_count}")
     finally:
         # Cleanup
         print("Cleaning up...")
